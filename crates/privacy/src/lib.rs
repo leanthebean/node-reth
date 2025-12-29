@@ -39,11 +39,16 @@
 pub mod classification;
 pub mod database;
 pub mod evm;
+pub mod executor;
 pub mod inspector;
+pub mod mode;
+pub mod nonce;
 pub mod precompiles;
 pub mod registry;
 pub mod rpc;
+pub mod shielded;
 pub mod store;
+pub mod transaction;
 
 // Re-exports for convenient access
 pub use classification::{classify_slot, SlotClassification};
@@ -59,3 +64,13 @@ pub use rpc::{PrivacyRpcFilter, RpcFilterConfig, StorageFilterResult};
 pub use store::{AuthEntry, PrivateEntry, PrivateStateStore, StoreError, READ, WRITE};
 pub use evm::PrivacyEvmFactory;
 pub use inspector::{PrivacyInspector, SlotKeyCache};
+
+// Phase 7 exports
+pub use mode::PrivacyMode;
+pub use nonce::{NonceError, PrivateNonceManager};
+pub use shielded::{DerivedKey, ShieldedKeyManager};
+pub use transaction::{PrivateTransaction, PrivateTransactionError};
+pub use executor::{
+    BlockTransaction, ExecutorError, PreparedExecution, PrivateExecutionResult,
+    PrivateTransactionExecutor,
+};

@@ -35,6 +35,16 @@ arc-swap.workspace = true
 derive_more = { workspace = true, features = ["display", "from"] }
 hex = "0.4"
 
+# Crypto for shielded key derivation
+k256 = { version = "0.13", features = ["ecdsa", "std"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Error handling
+thiserror = "2.0"
+
 [dev-dependencies]
 # Testing
 rstest.workspace = true

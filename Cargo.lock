@@ -1660,11 +1660,15 @@ dependencies = [
  "arc-swap",
  "derive_more",
  "hex",
+ "k256",
  "op-revm",
  "rand 0.9.2",
  "reth-provider",
  "revm",
  "rstest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
  "tokio",
 ]
 
