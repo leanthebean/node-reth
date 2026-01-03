@@ -5,6 +5,7 @@
 //! 2. Slot authorization via PrivateStateStore
 //! 3. Private state storage and retrieval
 //! 4. RPC filtering for unauthorized callers
+//! 5. Full EVM execution with privacy-aware database
 //!
 //! Note: These tests run the privacy layer components in isolation (without a full node).
 //! For full E2E tests with flashblocks, see `crates/rpc/tests/`.
@@ -14,12 +15,18 @@ use std::sync::Arc;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use base_reth_privacy::{
     PrivacyDatabase, PrivacyRegistry, PrivateStateStore,
+    executor::{PrivateTransactionExecutor, ExecutorError},
     inspector::SlotKeyCache,
+    nonce::PrivateNonceManager,
     registry::{PrivateContractConfig, OwnershipType, SlotConfig, SlotType},
     rpc::PrivacyRpcFilter,
+    shielded::ShieldedKeyManager,
     store::{AuthEntry, READ},
+    transaction::PrivateTransaction,
+    mode::PrivacyMode,
 };
 use revm::database_interface::{Database, DatabaseRef};
+use revm::DatabaseCommit;
 
 // Helper to create a test address
 fn test_address(n: u8) -> Address {
@@ -546,4 +553,458 @@ fn test_event_filtering_public_contract() {
     let unauthorized = test_address(99);
     let filtered = filter.filter_logs(vec![log], Some(unauthorized));
     assert_eq!(filtered.len(), 1);
+}
+
+// ============================================================================
+// Executor Integration Tests
+// ============================================================================
+
+/// Mock database that supports commit operations for executor tests.
+#[derive(Default, Clone, Debug)]
+struct MockCommitDatabase {
+    storage: std::collections::HashMap<(Address, U256), U256>,
+    code: std::collections::HashMap<Address, revm::bytecode::Bytecode>,
+}
+
+impl MockCommitDatabase {
+    fn with_contract(mut self, address: Address, bytecode: revm::bytecode::Bytecode) -> Self {
+        self.code.insert(address, bytecode);
+        self
+    }
+}
+
+impl Database for MockCommitDatabase {
+    type Error = std::convert::Infallible;
+
+    fn basic(
+        &mut self,
+        address: Address,
+    ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+        // Return account info with code if we have it
+        if let Some(code) = self.code.get(&address) {
+            Ok(Some(revm::state::AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128), // 1 ETH
+                nonce: 0,
+                code_hash: code.hash_slow(),
+                code: Some(code.clone()),
+            }))
+        } else {
+            Ok(Some(revm::state::AccountInfo::default()))
+        }
+    }
+
+    fn code_by_hash(
+        &mut self,
+        code_hash: B256,
+    ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+        // Find code by hash
+        for code in self.code.values() {
+            if code.hash_slow() == code_hash {
+                return Ok(code.clone());
+            }
+        }
+        Ok(revm::bytecode::Bytecode::default())
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        Ok(self.storage.get(&(address, index)).copied().unwrap_or(U256::ZERO))
+    }
+
+    fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
+        Ok(B256::ZERO)
+    }
+}
+
+impl DatabaseRef for MockCommitDatabase {
+    type Error = std::convert::Infallible;
+
+    fn basic_ref(
+        &self,
+        address: Address,
+    ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+        if let Some(code) = self.code.get(&address) {
+            Ok(Some(revm::state::AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128),
+                nonce: 0,
+                code_hash: code.hash_slow(),
+                code: Some(code.clone()),
+            }))
+        } else {
+            Ok(Some(revm::state::AccountInfo::default()))
+        }
+    }
+
+    fn code_by_hash_ref(
+        &self,
+        code_hash: B256,
+    ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+        for code in self.code.values() {
+            if code.hash_slow() == code_hash {
+                return Ok(code.clone());
+            }
+        }
+        Ok(revm::bytecode::Bytecode::default())
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        Ok(self.storage.get(&(address, index)).copied().unwrap_or(U256::ZERO))
+    }
+
+    fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+        Ok(B256::ZERO)
+    }
+}
+
+impl DatabaseCommit for MockCommitDatabase {
+    fn commit(&mut self, changes: revm::primitives::HashMap<Address, revm::state::Account>) {
+        for (address, account) in changes {
+            for (slot, value) in account.storage {
+                if value.present_value != value.original_value {
+                    self.storage.insert((address, slot), value.present_value);
+                }
+            }
+        }
+    }
+}
+
+// Test private key - Foundry's default test account #0
+// Address: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+// Key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+const TEST_PRIVATE_KEY: [u8; 32] = [
+    0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3,
+    0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff, 0x94,
+    0x4b, 0xac, 0xb4, 0x78, 0xcb, 0xed, 0x5e, 0xfc,
+    0xae, 0x78, 0x4d, 0x7b, 0xf4, 0xf2, 0xff, 0x80,
+];
+
+fn test_user_address() -> Address {
+    alloy_primitives::address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+}
+
+fn create_signed_tx(
+    from: Address,
+    to: Address,
+    data: Bytes,
+    mode: PrivacyMode,
+    nonce: u64,
+) -> PrivateTransaction {
+    let tx = PrivateTransaction::new(from, to, data, 1_000_000, nonce, mode, 84532);
+    tx.sign(&TEST_PRIVATE_KEY).expect("signing should succeed")
+}
+
+fn create_test_executor() -> (
+    PrivateTransactionExecutor,
+    Arc<PrivacyRegistry>,
+    Arc<PrivateStateStore>,
+    Arc<PrivateNonceManager>,
+) {
+    let nonce_manager = Arc::new(PrivateNonceManager::new());
+    let shielded_manager = Arc::new(ShieldedKeyManager::new(84532));
+    let registry = Arc::new(PrivacyRegistry::new());
+    let store = Arc::new(PrivateStateStore::new());
+
+    let executor = PrivateTransactionExecutor::new(
+        Arc::clone(&nonce_manager),
+        shielded_manager,
+        Arc::clone(&registry),
+        Arc::clone(&store),
+        84532,
+    );
+
+    (executor, registry, store, nonce_manager)
+}
+
+fn test_block_env() -> revm::context::BlockEnv {
+    revm::context::BlockEnv {
+        number: U256::from(1),
+        timestamp: U256::from(1704067200), // 2024-01-01
+        gas_limit: 30_000_000,
+        beneficiary: Address::ZERO,
+        ..Default::default()
+    }
+}
+
+/// Create bytecode that stores a value at a given slot.
+/// Bytecode: PUSH32 value, PUSH32 slot, SSTORE, STOP
+fn sstore_bytecode(slot: U256, value: U256) -> revm::bytecode::Bytecode {
+    let mut code = Vec::new();
+
+    // PUSH32 value
+    code.push(0x7f);
+    code.extend_from_slice(&value.to_be_bytes::<32>());
+
+    // PUSH32 slot
+    code.push(0x7f);
+    code.extend_from_slice(&slot.to_be_bytes::<32>());
+
+    // SSTORE
+    code.push(0x55);
+
+    // STOP
+    code.push(0x00);
+
+    revm::bytecode::Bytecode::new_raw(Bytes::from(code))
+}
+
+#[test]
+fn test_executor_validate_signed_transaction() {
+    let (executor, _, _, _) = create_test_executor();
+
+    let tx = create_signed_tx(
+        test_user_address(),
+        test_address(1),
+        Bytes::new(),
+        PrivacyMode::Real,
+        0,
+    );
+
+    // Validation should succeed
+    let result = executor.validate(&tx);
+    assert!(result.is_ok(), "validation failed: {:?}", result.err());
+}
+
+#[test]
+fn test_executor_validate_wrong_nonce() {
+    let (executor, _, _, _) = create_test_executor();
+
+    // Create tx with nonce 5 when expected is 0
+    let tx = create_signed_tx(
+        test_user_address(),
+        test_address(1),
+        Bytes::new(),
+        PrivacyMode::Real,
+        5, // Wrong nonce
+    );
+
+    let result = executor.validate(&tx);
+    assert!(result.is_err());
+
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, ExecutorError::Nonce(_)),
+        "expected Nonce error, got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn test_executor_validate_wrong_chain_id() {
+    let (executor, _, _, _) = create_test_executor();
+
+    // Create tx with wrong chain ID
+    let tx = PrivateTransaction::new(
+        test_user_address(),
+        test_address(1),
+        Bytes::new(),
+        1_000_000,
+        0,
+        PrivacyMode::Real,
+        1, // Wrong chain ID (expected 84532)
+    );
+    let signed = tx.sign(&TEST_PRIVATE_KEY).unwrap();
+
+    let result = executor.validate(&signed);
+    assert!(result.is_err());
+
+    let err = result.unwrap_err();
+    // The error should be a ChainIdMismatch - check the error type directly
+    assert!(
+        matches!(err, ExecutorError::ChainIdMismatch { .. }),
+        "expected ChainIdMismatch error, got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn test_executor_effective_sender_real_mode() {
+    let (executor, _, _, _) = create_test_executor();
+
+    let tx = create_signed_tx(
+        test_user_address(),
+        test_address(1),
+        Bytes::new(),
+        PrivacyMode::Real,
+        0,
+    );
+
+    let sender = executor.resolve_effective_sender(&tx);
+    assert_eq!(sender, test_user_address());
+}
+
+#[test]
+fn test_executor_effective_sender_shielded_mode() {
+    let (executor, _, _, _) = create_test_executor();
+
+    let tx = create_signed_tx(
+        test_user_address(),
+        test_address(1),
+        Bytes::new(),
+        PrivacyMode::Shielded {
+            protocol: test_address(1),
+            index: 0,
+        },
+        0,
+    );
+
+    let sender = executor.resolve_effective_sender(&tx);
+
+    // Shielded mode should give a different address
+    assert_ne!(sender, test_user_address());
+    assert!(!sender.is_zero());
+}
+
+#[test]
+fn test_executor_nonce_increment_on_prepare() {
+    let (executor, _, _, nonce_manager) = create_test_executor();
+
+    // Initial nonce should be 0
+    assert_eq!(nonce_manager.get_nonce(test_user_address()), 0);
+
+    let tx = create_signed_tx(
+        test_user_address(),
+        test_address(1),
+        Bytes::new(),
+        PrivacyMode::Real,
+        0,
+    );
+
+    // Prepare execution (which uses the nonce)
+    let result = executor.prepare_execution(&tx);
+    assert!(result.is_ok());
+
+    // Nonce should be incremented
+    assert_eq!(nonce_manager.get_nonce(test_user_address()), 1);
+}
+
+#[test]
+fn test_execute_private_tx_simple_call() {
+    let (executor, _, store, _) = create_test_executor();
+
+    let contract = test_address(100);
+    let slot = U256::from(42);
+    let value = U256::from(12345);
+
+    // Create bytecode that stores value at slot
+    let bytecode = sstore_bytecode(slot, value);
+    let db = MockCommitDatabase::default().with_contract(contract, bytecode);
+
+    let tx = create_signed_tx(
+        test_user_address(),
+        contract,
+        Bytes::new(), // No calldata needed, contract just runs
+        PrivacyMode::Real,
+        0,
+    );
+
+    let result = executor.execute_private_tx(&tx, db, test_block_env(), op_revm::OpSpecId::CANYON);
+
+    assert!(result.is_ok(), "execution failed: {:?}", result.err());
+
+    let exec_result = result.unwrap();
+    assert!(exec_result.success);
+    assert_eq!(exec_result.effective_sender, test_user_address());
+    assert_eq!(exec_result.real_sender, test_user_address());
+
+    // Contract is not registered, so this is a public write
+    assert!(exec_result.public_write_occurred);
+    assert!(exec_result.block_transaction.is_some());
+
+    // Value should NOT be in private store (public write)
+    assert_eq!(store.get(contract, slot), U256::ZERO);
+}
+
+#[test]
+fn test_execute_private_tx_private_slot_write() {
+    let (executor, registry, store, _) = create_test_executor();
+
+    let contract = test_address(100);
+    let slot = U256::from(5);
+    let value = U256::from(99999);
+
+    // Register contract with private slot
+    let config = create_config(
+        contract,
+        test_user_address(),
+        vec![SlotConfig {
+            base_slot: slot,
+            slot_type: SlotType::Simple,
+            ownership: OwnershipType::Contract,
+        }],
+        false,
+    );
+    registry.register(config).unwrap();
+
+    // Create bytecode that stores value at the private slot
+    let bytecode = sstore_bytecode(slot, value);
+    let db = MockCommitDatabase::default().with_contract(contract, bytecode);
+
+    let tx = create_signed_tx(
+        test_user_address(),
+        contract,
+        Bytes::new(),
+        PrivacyMode::Real,
+        0,
+    );
+
+    let result = executor.execute_private_tx(&tx, db, test_block_env(), op_revm::OpSpecId::CANYON);
+
+    assert!(result.is_ok(), "execution failed: {:?}", result.err());
+
+    let exec_result = result.unwrap();
+    assert!(exec_result.success);
+
+    // Private slot write should NOT trigger block transaction
+    assert!(!exec_result.public_write_occurred);
+    assert!(exec_result.block_transaction.is_none());
+
+    // Value SHOULD be in private store
+    assert_eq!(store.get(contract, slot), value);
+}
+
+#[test]
+fn test_execute_private_tx_shielded_mode() {
+    let (executor, _, _, _) = create_test_executor();
+
+    let contract = test_address(100);
+    let slot = U256::from(42);
+    let value = U256::from(12345);
+
+    let bytecode = sstore_bytecode(slot, value);
+    let db = MockCommitDatabase::default().with_contract(contract, bytecode);
+
+    let tx = create_signed_tx(
+        test_user_address(),
+        contract,
+        Bytes::new(),
+        PrivacyMode::Shielded {
+            protocol: contract,
+            index: 0,
+        },
+        0,
+    );
+
+    let result = executor.execute_private_tx(&tx, db, test_block_env(), op_revm::OpSpecId::CANYON);
+
+    assert!(result.is_ok(), "execution failed: {:?}", result.err());
+
+    let exec_result = result.unwrap();
+    assert!(exec_result.success);
+
+    // Effective sender should be shielded address
+    assert_ne!(exec_result.effective_sender, test_user_address());
+    assert_eq!(exec_result.real_sender, test_user_address());
+
+    // Public write occurred (unregistered contract)
+    assert!(exec_result.public_write_occurred);
+
+    // Block transaction should be from shielded address
+    let block_tx = exec_result.block_transaction.unwrap();
+    assert_eq!(block_tx.from, exec_result.effective_sender);
+
+    // Signature should be valid for shielded address
+    let recovered = block_tx
+        .signature
+        .recover_address_from_prehash(&block_tx.tx_hash)
+        .unwrap();
+    assert_eq!(recovered, exec_result.effective_sender);
 }

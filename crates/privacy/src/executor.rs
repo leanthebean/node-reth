@@ -47,12 +47,27 @@
 //! ```
 
 use crate::{
+    database::PrivacyDatabase,
+    evm::PrivacyEvmFactory,
+    inspector::{PrivacyInspector, SlotKeyCache},
     mode::PrivacyMode,
     nonce::{NonceError, PrivateNonceManager},
+    precompiles::{clear_context, setup_precompile_context},
+    registry::PrivacyRegistry,
     shielded::ShieldedKeyManager,
+    store::PrivateStateStore,
     transaction::{PrivateTransaction, PrivateTransactionError},
 };
-use alloy_primitives::{Address, Bytes, Signature, B256};
+use alloy_evm::{Evm, EvmEnv, EvmFactory};
+use alloy_primitives::{Address, Bytes, Signature, TxKind, B256, U256};
+use op_revm::{OpSpecId, OpTransaction};
+use revm::{
+    context::{BlockEnv, CfgEnv, TxEnv},
+    database_interface::Database,
+    primitives::HashMap,
+    DatabaseCommit,
+};
+use std::fmt::Debug;
 use std::sync::Arc;
 
 /// Result of executing a private transaction.
@@ -121,6 +136,12 @@ pub struct PrivateTransactionExecutor {
     /// Shielded key manager.
     shielded_manager: Arc<ShieldedKeyManager>,
 
+    /// Privacy registry for slot classification.
+    registry: Arc<PrivacyRegistry>,
+
+    /// Private state store.
+    private_store: Arc<PrivateStateStore>,
+
     /// Chain ID.
     chain_id: u64,
 }
@@ -130,13 +151,27 @@ impl PrivateTransactionExecutor {
     pub fn new(
         nonce_manager: Arc<PrivateNonceManager>,
         shielded_manager: Arc<ShieldedKeyManager>,
+        registry: Arc<PrivacyRegistry>,
+        private_store: Arc<PrivateStateStore>,
         chain_id: u64,
     ) -> Self {
         Self {
             nonce_manager,
             shielded_manager,
+            registry,
+            private_store,
             chain_id,
         }
+    }
+
+    /// Get the privacy registry.
+    pub fn registry(&self) -> &PrivacyRegistry {
+        &self.registry
+    }
+
+    /// Get the private store.
+    pub fn private_store(&self) -> &PrivateStateStore {
+        &self.private_store
     }
 
     /// Get the nonce manager.
@@ -231,6 +266,175 @@ impl PrivateTransactionExecutor {
             gas_limit: tx.gas_limit,
             mode: tx.mode,
         })
+    }
+
+    /// Execute a private transaction with EVM.
+    ///
+    /// This is the main entry point for private transaction execution.
+    /// It:
+    /// 1. Validates the transaction
+    /// 2. Sets up the privacy-aware EVM
+    /// 3. Executes the transaction
+    /// 4. Tracks public vs private writes
+    /// 5. Creates a block transaction if needed
+    ///
+    /// # Type Parameters
+    ///
+    /// * `DB` - The underlying database type (must implement Database + DatabaseCommit)
+    ///
+    /// # Arguments
+    ///
+    /// * `tx` - The private transaction to execute
+    /// * `db` - The underlying state database
+    /// * `block_env` - Block environment for the EVM
+    /// * `spec_id` - The OP spec ID to use
+    ///
+    /// # Returns
+    ///
+    /// The execution result including output, gas used, and whether public writes occurred.
+    pub fn execute_private_tx<DB>(
+        &self,
+        tx: &PrivateTransaction,
+        db: DB,
+        block_env: BlockEnv,
+        spec_id: OpSpecId,
+    ) -> Result<PrivateExecutionResult, ExecutorError>
+    where
+        DB: Database + DatabaseCommit + Clone + Debug,
+        DB::Error: std::error::Error + Send + Sync + 'static,
+    {
+        // 1. Validate and prepare
+        let prepared = self.prepare_execution(tx)?;
+
+        // 2. Set up privacy database
+        let slot_key_cache = Arc::new(SlotKeyCache::new());
+        let mut privacy_db = PrivacyDatabase::new(
+            db,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.private_store),
+        );
+        privacy_db.set_slot_key_cache(Arc::clone(&slot_key_cache));
+        privacy_db.set_tx_sender(prepared.effective_sender);
+        // Convert U256 block number to u64 (safe for practical block numbers)
+        let block_number: u64 = block_env.number.try_into().unwrap_or(u64::MAX);
+        privacy_db.set_block(block_number);
+
+        // 3. Set up precompile context
+        setup_precompile_context(
+            Arc::clone(&self.registry),
+            Arc::clone(&self.private_store),
+            prepared.effective_sender,
+            block_number,
+        );
+
+        // 4. Create EVM with privacy inspector
+        let inspector = PrivacyInspector::new(Arc::clone(&slot_key_cache));
+        let evm_factory = PrivacyEvmFactory::new();
+
+        let cfg_env = CfgEnv::new_with_spec(spec_id);
+        let evm_env = EvmEnv::new(cfg_env, block_env);
+
+        let mut evm = evm_factory.create_evm_with_inspector(privacy_db, evm_env, inspector);
+
+        // 5. Set up transaction environment
+        let tx_env = TxEnv {
+            caller: prepared.effective_sender,
+            gas_limit: prepared.gas_limit,
+            data: prepared.data.clone(),
+            kind: TxKind::Call(prepared.to),
+            value: U256::ZERO,
+            ..Default::default()
+        };
+
+        // Wrap in OpTransaction for the OP EVM
+        // We set a dummy enveloped_tx to satisfy the OP EVM validation.
+        // This is required for L1 cost calculation, but we use a minimal placeholder
+        // since private transactions don't need accurate L1 cost estimates.
+        let mut op_tx = OpTransaction::new(tx_env);
+        op_tx.enveloped_tx = Some(Bytes::from(vec![0x00]));
+
+        // 6. Execute the transaction
+        let exec_result = evm
+            .transact_raw(op_tx)
+            .map_err(|e| ExecutorError::Execution(format!("EVM error: {e}")))?;
+
+        // 7. Get the output and gas used
+        let (success, output, gas_used) = match &exec_result.result {
+            revm::context::result::ExecutionResult::Success { output, gas_used, .. } => {
+                let bytes = match output {
+                    revm::context::result::Output::Call(b) => b.clone(),
+                    revm::context::result::Output::Create(b, _) => b.clone(),
+                };
+                (true, Bytes::from(bytes.to_vec()), *gas_used)
+            }
+            revm::context::result::ExecutionResult::Revert { output, gas_used } => {
+                (false, Bytes::from(output.to_vec()), *gas_used)
+            }
+            revm::context::result::ExecutionResult::Halt { gas_used, .. } => {
+                (false, Bytes::new(), *gas_used)
+            }
+        };
+
+        // 8. Detect public writes by checking which state changes go to public vs private
+        let public_write_occurred = self.detect_public_writes(&exec_result.state);
+
+        // 9. Commit state changes through the privacy database
+        // This routes private slots to the private store and public slots to the underlying DB
+        let mut db = evm.into_db();
+        db.commit(exec_result.state);
+
+        // 10. Clear precompile context
+        clear_context();
+        db.clear_tx_context();
+
+        // 11. Create block transaction if needed
+        let block_transaction = if public_write_occurred {
+            Some(self.create_block_transaction(tx, prepared.effective_sender)?)
+        } else {
+            None
+        };
+
+        Ok(PrivateExecutionResult {
+            success,
+            output,
+            gas_used,
+            public_write_occurred,
+            effective_sender: prepared.effective_sender,
+            real_sender: prepared.real_sender,
+            block_transaction,
+        })
+    }
+
+    /// Detect if any public storage writes occurred in the execution result.
+    ///
+    /// We check each storage change to see if it's classified as public or private.
+    fn detect_public_writes(
+        &self,
+        state: &HashMap<Address, revm::state::Account>,
+    ) -> bool {
+        use crate::classification::{classify_slot, SlotClassification};
+
+        for (address, account) in state {
+            for (slot, value) in &account.storage {
+                // Only check slots that actually changed
+                if value.present_value == value.original_value {
+                    continue;
+                }
+
+                // Classify the slot
+                match classify_slot(&self.registry, *address, *slot) {
+                    SlotClassification::Public => {
+                        // Public write detected!
+                        return true;
+                    }
+                    SlotClassification::Private { .. } => {
+                        // Private write, doesn't trigger block tx
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     /// Roll back a nonce after execution failure.
@@ -360,7 +564,15 @@ mod tests {
     fn create_executor() -> PrivateTransactionExecutor {
         let nonce_manager = Arc::new(PrivateNonceManager::new());
         let shielded_manager = Arc::new(ShieldedKeyManager::new(84532));
-        PrivateTransactionExecutor::new(nonce_manager, shielded_manager, 84532)
+        let registry = Arc::new(PrivacyRegistry::new());
+        let private_store = Arc::new(PrivateStateStore::new());
+        PrivateTransactionExecutor::new(
+            nonce_manager,
+            shielded_manager,
+            registry,
+            private_store,
+            84532,
+        )
     }
 
     fn unsigned_tx(mode: PrivacyMode) -> PrivateTransaction {

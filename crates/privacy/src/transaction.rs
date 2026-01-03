@@ -215,9 +215,8 @@ impl PrivateTransaction {
         }
     }
 
-    /// Create an unsigned transaction (for testing).
-    #[cfg(test)]
-    pub fn unsigned(
+    /// Create a new unsigned transaction.
+    pub fn new(
         from: Address,
         to: Address,
         data: Bytes,
@@ -237,6 +236,52 @@ impl PrivateTransaction {
             chain_id,
             signature: Signature::new(U256::ZERO, U256::ZERO, false),
         }
+    }
+
+    /// Sign the transaction with a private key.
+    pub fn sign(mut self, private_key: &[u8; 32]) -> Result<Self, PrivateTransactionError> {
+        use k256::ecdsa::{RecoveryId, Signature as K256Sig, SigningKey};
+
+        let signing_hash = self.signing_hash();
+
+        let signing_key = SigningKey::from_bytes(private_key.into())
+            .map_err(|_| PrivateTransactionError::InvalidPrivateKey)?;
+
+        let (sig, recovery_id): (K256Sig, RecoveryId) = signing_key
+            .sign_prehash_recoverable(signing_hash.as_slice())
+            .map_err(|_| PrivateTransactionError::SigningFailed)?;
+
+        let r = U256::from_be_slice(&sig.r().to_bytes());
+        let s = U256::from_be_slice(&sig.s().to_bytes());
+        let v = recovery_id.is_y_odd();
+
+        self.signature = Signature::new(r, s, v);
+        Ok(self)
+    }
+
+    /// Serialize the transaction to bytes (JSON format).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PrivateTransactionError> {
+        serde_json::to_vec(self).map_err(|e| PrivateTransactionError::Serialization(e.to_string()))
+    }
+
+    /// Deserialize a transaction from bytes (JSON format).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PrivateTransactionError> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| PrivateTransactionError::Deserialization(e.to_string()))
+    }
+
+    /// Create an unsigned transaction (for testing).
+    #[cfg(test)]
+    pub fn unsigned(
+        from: Address,
+        to: Address,
+        data: Bytes,
+        gas_limit: u64,
+        private_nonce: u64,
+        mode: PrivacyMode,
+        chain_id: u64,
+    ) -> Self {
+        Self::new(from, to, data, gas_limit, private_nonce, mode, chain_id)
     }
 }
 
@@ -276,6 +321,22 @@ pub enum PrivateTransactionError {
         /// The provided nonce.
         actual: u64,
     },
+
+    /// Invalid private key.
+    #[error("invalid private key")]
+    InvalidPrivateKey,
+
+    /// Signing failed.
+    #[error("signing failed")]
+    SigningFailed,
+
+    /// Serialization error.
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    /// Deserialization error.
+    #[error("deserialization error: {0}")]
+    Deserialization(String),
 }
 
 #[cfg(test)]

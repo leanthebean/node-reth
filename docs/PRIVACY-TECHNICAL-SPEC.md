@@ -4,7 +4,7 @@
 >
 > **Audience**: node-reth developers (primary), smart contract developers (secondary).
 
-**Version:** 5.0 | **Status:** Draft | **Last Updated:** 2025-12-23
+**Version:** 5.1 | **Status:** Draft | **Last Updated:** 2025-12-29
 
 ---
 
@@ -532,6 +532,102 @@ fn get_or_create_seed(user: Address) -> [u8; 32] {
 | `priv_getStorageAt` | Get private storage (with auth) |
 | `priv_getShieldedAddress` | Get shielded address for protocol+index |
 
+### 9.3 Implementation Details
+
+The RPC handler logic is implemented in `PrivacyRpcHandler` (`rpc_handler.rs`):
+
+```rust
+/// Handler for privacy-related RPC methods.
+pub struct PrivacyRpcHandler {
+    executor: Arc<PrivateTransactionExecutor>,
+    spec_id: OpSpecId,
+}
+
+impl PrivacyRpcHandler {
+    /// Submit a private transaction.
+    pub fn send_raw_transaction<DB>(
+        &self,
+        raw_tx: &Bytes,
+        db: DB,
+        block_env: BlockEnv,
+    ) -> Result<PrivateExecutionResult, PrivacyRpcError>;
+
+    /// Get the current private nonce for an address.
+    pub fn get_private_nonce(&self, address: Address) -> u64;
+
+    /// Get the shielded address for a user, protocol, and index.
+    pub fn get_shielded_address(
+        &self,
+        user: Address,
+        protocol: Address,
+        index: u64,
+    ) -> Address;
+
+    /// Get a private storage value (with authorization check).
+    pub fn get_private_storage(
+        &self,
+        contract: Address,
+        slot: U256,
+        caller: Address,
+    ) -> U256;
+}
+```
+
+**Request/Response formats:**
+
+```json
+// priv_sendRawTransaction
+// Request: hex-encoded JSON PrivateTransaction
+{
+    "jsonrpc": "2.0",
+    "method": "priv_sendRawTransaction",
+    "params": ["0x7b2266726f6d223a..."],
+    "id": 1
+}
+// Response: execution result with tx hash
+{
+    "jsonrpc": "2.0",
+    "result": {
+        "txHash": "0x...",
+        "success": true,
+        "gasUsed": 50000,
+        "logs": [...],
+        "blockTx": null  // or BlockTransaction if public writes
+    },
+    "id": 1
+}
+
+// priv_getPrivateNonce
+{
+    "jsonrpc": "2.0",
+    "method": "priv_getPrivateNonce",
+    "params": ["0x1234..."],
+    "id": 1
+}
+// Response
+{ "jsonrpc": "2.0", "result": "0x5", "id": 1 }
+
+// priv_getShieldedAddress
+{
+    "jsonrpc": "2.0",
+    "method": "priv_getShieldedAddress",
+    "params": ["0xuser...", "0xprotocol...", "0x0"],
+    "id": 1
+}
+// Response
+{ "jsonrpc": "2.0", "result": "0x9876...", "id": 1 }
+```
+
+### 9.4 Error Codes
+
+| Error | Code | Description |
+|-------|------|-------------|
+| `InvalidTransaction` | -32000 | Malformed or invalid transaction |
+| `SignerMismatch` | -32001 | Signature doesn't match `from` address |
+| `InvalidNonce` | -32002 | Private nonce doesn't match expected |
+| `ExecutionFailed` | -32003 | EVM execution reverted |
+| `Unauthorized` | -32004 | Caller not authorized for private storage |
+
 ---
 
 ## 10. Exit Mechanism
@@ -732,46 +828,93 @@ contract AnonymousVoting is PrivacyEnabled {
 
 ## 15. Implementation Phases
 
-### Phase 1: State Persistence
-- [ ] MDBX tables
-- [ ] Private nonce tracking (by real address)
+### Phase 1: State Persistence ✓
+- [x] In-memory private state store (`store.rs`)
+- [x] Private nonce tracking by real address (`nonce.rs`)
+- [x] Authorization entries with expiry support
+- [ ] MDBX tables (persisted to disk)
 - [ ] Crash recovery
 
-### Phase 2: Basic priv_* with Real Mode
-- [ ] PrivateTransaction struct
-- [ ] PrivacyMode enum
-- [ ] Nonce validation
-- [ ] Storage routing
+### Phase 2: Basic priv_* with Real Mode ✓
+- [x] PrivateTransaction struct (`transaction.rs`)
+- [x] PrivacyMode enum with Real/Shielded variants (`mode.rs`)
+- [x] Private nonce validation
+- [x] Storage routing via PrivacyDatabase (`database.rs`)
+- [x] Slot classification (public vs private) (`classification.rs`)
 
-### Phase 3: Shielded Mode
-- [ ] Seed generation and storage
-- [ ] Shielded address derivation with index
-- [ ] Shielded tx creation and signing
+### Phase 3: Shielded Mode ✓
+- [x] Seed generation and in-memory storage (`shielded.rs`)
+- [x] Shielded address derivation with protocol+index
+- [x] Derived key management (sign on behalf of shielded address)
 - [ ] Gas funding for shielded addresses
 
-### Phase 4: Developer Experience
-- [ ] Contract templates
-- [ ] Testing tools
-- [ ] Documentation
+### Phase 4: Privacy Precompiles ✓
+- [x] Privacy Registry precompile at 0x0200 (`precompiles/registry.rs`)
+- [x] Privacy Auth precompile at 0x0201 (`precompiles/auth.rs`)
+- [x] Precompile context management (`precompiles/context.rs`)
+- [x] Custom EVM factory with privacy precompiles (`evm.rs`)
+
+### Phase 5: EVM Execution Integration ✓
+- [x] PrivacyDatabase wrapping state DB with private slot routing
+- [x] PrivacyInspector intercepting SHA3 for mapping key tracking
+- [x] PrivacyEvmFactory creating EVM with privacy precompiles
+- [x] Full `execute_private_tx()` implementation (`executor.rs`)
+- [x] RPC handler logic for priv_* methods (`rpc_handler.rs`)
+
+### Phase 6: Developer Experience
+- [x] Contract base class `PrivacyEnabled.sol`
+- [x] Example contracts (PrivacyPoker, GameLib)
+- [ ] TypeScript SDK for priv_* transactions
+- [ ] Testing tools for private storage
+
+### Phase 7: Frontend & E2E
+- [ ] Privacy Poker frontend (Next.js)
+- [ ] Wallet integration for private transactions
+- [ ] Testnet deployment
+- [ ] End-to-end testing
 
 ---
 
 ## 16. File Locations
 
-### New/Modified Files
+### Core Privacy Crate (`crates/privacy/src/`)
 
 | File | Purpose |
 |------|---------|
-| `crates/privacy/src/mode.rs` | PrivacyMode enum |
-| `crates/privacy/src/shielded.rs` | Shielded address derivation |
-| `crates/privacy/src/transaction.rs` | PrivateTransaction handling |
+| `lib.rs` | Crate root with public exports |
+| `mode.rs` | `PrivacyMode` enum (Real/Shielded variants) |
+| `shielded.rs` | `ShieldedKeyManager` - seed management and address derivation |
+| `transaction.rs` | `PrivateTransaction` struct with signing and serialization |
+| `nonce.rs` | `PrivateNonceManager` - private nonce tracking by real address |
+| `store.rs` | `PrivateStateStore` - in-memory private slot storage |
+| `registry.rs` | `PrivacyRegistry` - contract registration and slot configs |
+| `classification.rs` | Slot classification (public vs private) |
+| `database.rs` | `PrivacyDatabase` - DB wrapper routing private slots |
+| `inspector.rs` | `PrivacyInspector` - SHA3 interception for mapping keys |
+| `evm.rs` | `PrivacyEvmFactory` - EVM factory with privacy precompiles |
+| `executor.rs` | `PrivateTransactionExecutor` - full EVM execution |
+| `rpc_handler.rs` | `PrivacyRpcHandler` - logic for priv_* RPC methods |
+| `rpc.rs` | `PrivacyRpcFilter` - RPC response filtering |
 
-### Contract Files
+### Precompiles (`crates/privacy/src/precompiles/`)
 
 | File | Purpose |
 |------|---------|
-| `contracts/examples/PrivacyVault.sol` | Example vault |
-| `contracts/examples/AnonymousVoting.sol` | Example voting |
+| `mod.rs` | Precompile set creation and context setup |
+| `registry.rs` | Privacy Registry precompile (0x0200) |
+| `auth.rs` | Privacy Auth precompile (0x0201) |
+| `context.rs` | Thread-local precompile context |
+| `encoding.rs` | ABI encoding/decoding utilities |
+| `error.rs` | Precompile error types |
+| `constants.rs` | Addresses and function selectors |
+
+### Contract Files (privacy-poker repo)
+
+| File | Purpose |
+|------|---------|
+| `contracts/src/PrivacyPoker.sol` | Texas Hold'em with private hands |
+| `contracts/src/GameLib.sol` | Poker hand evaluation library |
+| `contracts/lib/privacy/base/PrivacyEnabled.sol` | Base contract for privacy registration |
 
 ---
 

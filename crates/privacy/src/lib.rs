@@ -46,6 +46,7 @@ pub mod nonce;
 pub mod precompiles;
 pub mod registry;
 pub mod rpc;
+pub mod rpc_handler;
 pub mod shielded;
 pub mod store;
 pub mod transaction;
@@ -74,3 +75,4 @@ pub use executor::{
     BlockTransaction, ExecutorError, PreparedExecution, PrivateExecutionResult,
     PrivateTransactionExecutor,
 };
+pub use rpc_handler::{PrivacyRpcHandler, PrivacyRpcError};
