@@ -49,6 +49,10 @@ tokio-stream.workspace = true
 jsonrpsee.workspace = true
 jsonrpsee-types.workspace = true
 
+# revm
+revm = { workspace = true, optional = true }
+op-revm = { workspace = true, optional = true }
+
 # misc
 tracing.workspace = true
 eyre.workspace = true
@@ -85,7 +89,7 @@ alloy-contract.workspace = true
 
 [features]
 default = []
-privacy = ["dep:base-reth-privacy"]
+privacy = ["dep:base-reth-privacy", "dep:revm", "dep:op-revm"]
 
 [package.metadata.cargo-udeps.ignore]
 normal = ["reth-optimism-cli"]

@@ -313,7 +313,7 @@ impl PrivateTransactionExecutor {
         spec_id: OpSpecId,
     ) -> Result<PrivateExecutionResult, ExecutorError>
     where
-        DB: Database + DatabaseCommit + Clone + Debug,
+        DB: Database + DatabaseCommit + Debug,
         DB::Error: std::error::Error + Send + Sync + 'static,
     {
         // 1. Validate and prepare (nonce is reserved but NOT incremented)

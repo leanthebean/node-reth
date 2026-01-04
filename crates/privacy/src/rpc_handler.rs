@@ -76,7 +76,7 @@ impl PrivacyRpcHandler {
         block_env: BlockEnv,
     ) -> Result<PrivateExecutionResult, PrivacyRpcError>
     where
-        DB: Database + DatabaseCommit + Clone + Debug,
+        DB: Database + DatabaseCommit + Debug,
         DB::Error: std::error::Error + Send + Sync + 'static,
     {
         // Decode the transaction

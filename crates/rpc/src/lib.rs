@@ -19,4 +19,9 @@ pub use base::{
 mod eth;
 pub use eth::rpc::{EthApiExt, EthApiOverrideServer};
 
+#[cfg(feature = "privacy")]
+mod priv_;
+#[cfg(feature = "privacy")]
+pub use priv_::{PrivacyApiImpl, PrivacyApiServer, PrivateTransactionResult};
+
 mod metrics;

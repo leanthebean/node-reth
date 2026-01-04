@@ -13,10 +13,15 @@ mod runner;
 pub use runner::BaseNodeRunner;
 
 mod config;
-pub use config::{BaseNodeConfig, FlashblocksConfig, TracingConfig};
+pub use config::{BaseNodeConfig, FlashblocksConfig, PrivacyConfig, TracingConfig};
 
 mod extensions;
 pub use extensions::{
     BaseNodeExtension, BaseRpcExtension, ConfigurableBaseNodeExtension, FlashblocksCanonExtension,
     FlashblocksCell, OpBuilder, OpProvider, TransactionTracingExtension,
+};
+#[cfg(feature = "privacy")]
+pub use extensions::{
+    PrivacyRegistryCell, PrivacyRpcConfig, PrivacyRpcExtension, PrivateNonceCell,
+    PrivateStoreCell, ShieldedKeyCell,
 };

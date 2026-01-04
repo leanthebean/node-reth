@@ -17,12 +17,19 @@ pub struct BaseNodeConfig {
     pub metering_enabled: bool,
     /// Shared Flashblocks state cache.
     pub flashblocks_cell: FlashblocksCell,
+    /// Optional privacy layer configuration.
+    pub privacy: Option<PrivacyConfig>,
 }
 
 impl BaseNodeConfig {
     /// Returns `true` if flashblocks support should be wired up.
     pub const fn flashblocks_enabled(&self) -> bool {
         self.flashblocks.is_some()
+    }
+
+    /// Returns `true` if privacy layer support should be wired up.
+    pub const fn privacy_enabled(&self) -> bool {
+        self.privacy.is_some()
     }
 }
 
@@ -42,4 +49,13 @@ pub struct TracingConfig {
     pub enabled: bool,
     /// Emits `info`-level logs for the tracing ExEx when enabled.
     pub logs_enabled: bool,
+}
+
+/// Privacy layer configuration.
+#[derive(Debug, Clone)]
+pub struct PrivacyConfig {
+    /// Chain ID for privacy layer operations.
+    ///
+    /// Used for shielded address derivation and transaction validation.
+    pub chain_id: u64,
 }
