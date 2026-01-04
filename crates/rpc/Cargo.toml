@@ -61,6 +61,7 @@ metrics.workspace = true
 metrics-derive.workspace = true
 
 [dev-dependencies]
+base-reth-privacy.workspace = true
 reth-optimism-primitives.workspace = true
 op-alloy-consensus.workspace = true
 alloy-genesis.workspace = true

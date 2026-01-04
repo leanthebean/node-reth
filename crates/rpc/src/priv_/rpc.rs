@@ -207,3 +207,95 @@ fn rpc_internal_error(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
         None::<()>,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use base_reth_privacy::ExecutorError;
+
+    fn test_header() -> Header {
+        Header {
+            number: 100,
+            beneficiary: Address::repeat_byte(0x42),
+            timestamp: 1704067200,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+            difficulty: U256::ZERO,
+            mix_hash: B256::repeat_byte(0xab),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_block_env_from_header_basic() {
+        let header = test_header();
+        let env = block_env_from_header(&header);
+
+        assert_eq!(env.number, U256::from(100));
+        assert_eq!(env.beneficiary, Address::repeat_byte(0x42));
+        assert_eq!(env.timestamp, U256::from(1704067200u64));
+        assert_eq!(env.gas_limit, 30_000_000);
+        assert_eq!(env.basefee, 1_000_000_000);
+        assert_eq!(env.prevrandao, Some(B256::repeat_byte(0xab)));
+    }
+
+    #[test]
+    fn test_block_env_from_header_no_base_fee() {
+        let header = Header {
+            base_fee_per_gas: None,
+            ..test_header()
+        };
+        let env = block_env_from_header(&header);
+
+        assert_eq!(env.basefee, 0);
+    }
+
+    #[test]
+    fn test_convert_privacy_error_invalid_transaction() {
+        let err = PrivacyRpcError::InvalidTransaction("bad format".into());
+        let rpc_err = convert_privacy_error(err);
+
+        assert_eq!(rpc_err.code(), jsonrpsee::types::ErrorCode::InvalidParams.code());
+        assert!(rpc_err.message().contains("Invalid transaction"));
+        assert!(rpc_err.message().contains("bad format"));
+    }
+
+    #[test]
+    fn test_convert_privacy_error_executor() {
+        let err = PrivacyRpcError::Executor(ExecutorError::ChainIdMismatch {
+            expected: 84532,
+            actual: 1,
+        });
+        let rpc_err = convert_privacy_error(err);
+
+        assert_eq!(rpc_err.code(), jsonrpsee::types::ErrorCode::InternalError.code());
+        assert!(rpc_err.message().contains("Executor error"));
+    }
+
+    #[test]
+    fn test_convert_privacy_error_signing() {
+        let err = PrivacyRpcError::SigningError("invalid signature".into());
+        let rpc_err = convert_privacy_error(err);
+
+        assert_eq!(rpc_err.code(), jsonrpsee::types::ErrorCode::InvalidParams.code());
+        assert!(rpc_err.message().contains("Signing error"));
+    }
+
+    #[test]
+    fn test_convert_privacy_error_database() {
+        let err = PrivacyRpcError::Database("connection failed".into());
+        let rpc_err = convert_privacy_error(err);
+
+        assert_eq!(rpc_err.code(), jsonrpsee::types::ErrorCode::InternalError.code());
+        assert!(rpc_err.message().contains("Database error"));
+    }
+
+    #[test]
+    fn test_rpc_internal_error() {
+        let err = rpc_internal_error("something broke".to_string());
+
+        assert_eq!(err.code(), jsonrpsee::types::ErrorCode::InternalError.code());
+        assert_eq!(err.message(), "something broke");
+    }
+}
