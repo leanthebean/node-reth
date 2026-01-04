@@ -38,6 +38,9 @@ hex = "0.4"
 # Crypto for shielded key derivation
 k256 = { version = "0.13", features = ["ecdsa", "std"] }
 
+# Random number generation for seed creation
+rand = { workspace = true }
+
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

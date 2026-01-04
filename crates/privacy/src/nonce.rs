@@ -40,7 +40,60 @@
 
 use alloy_primitives::Address;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
+
+/// A reserved nonce that can be committed after successful execution.
+///
+/// This implements the two-phase nonce pattern:
+/// 1. Call `reserve_nonce()` to validate and create a reservation
+/// 2. After successful execution, call `commit()` to increment the nonce
+///
+/// If the reservation is dropped without calling `commit()`, the nonce
+/// remains unchanged, allowing the transaction to be retried.
+#[derive(Debug)]
+pub struct NonceReservation {
+    /// The user address this reservation is for
+    user: Address,
+    /// The expected nonce that was validated
+    expected_nonce: u64,
+    /// Whether this reservation has been committed
+    committed: AtomicBool,
+}
+
+impl NonceReservation {
+    /// Create a new nonce reservation.
+    fn new(user: Address, expected_nonce: u64) -> Self {
+        Self {
+            user,
+            expected_nonce,
+            committed: AtomicBool::new(false),
+        }
+    }
+
+    /// Get the user address for this reservation.
+    pub fn user(&self) -> Address {
+        self.user
+    }
+
+    /// Get the expected nonce that was validated.
+    pub fn expected_nonce(&self) -> u64 {
+        self.expected_nonce
+    }
+
+    /// Check if this reservation has been committed.
+    pub fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::SeqCst)
+    }
+
+    /// Mark this reservation as committed.
+    ///
+    /// This should be called by the nonce manager's `commit_reservation` method,
+    /// not directly.
+    fn mark_committed(&self) {
+        self.committed.store(true, Ordering::SeqCst);
+    }
+}
 
 /// Manages private nonces for priv_* transactions.
 ///
@@ -121,6 +174,79 @@ impl PrivateNonceManager {
 
         *nonces.entry(user).or_insert(0) += 1;
         Ok(())
+    }
+
+    /// Reserve a nonce for later commitment (two-phase nonce pattern).
+    ///
+    /// This method validates the nonce but does NOT increment it.
+    /// After successful execution, call `commit_reservation()` to increment.
+    ///
+    /// # Two-Phase Nonce Pattern
+    ///
+    /// This is the recommended approach for transaction execution:
+    ///
+    /// ```ignore
+    /// // 1. Reserve the nonce (validates without incrementing)
+    /// let reservation = manager.reserve_nonce(user, tx_nonce)?;
+    ///
+    /// // 2. Execute the transaction
+    /// let result = execute_tx(...);
+    ///
+    /// // 3. Commit only on success
+    /// if result.is_ok() {
+    ///     manager.commit_reservation(&reservation);
+    /// }
+    /// // If execution failed, reservation is dropped without incrementing
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `NonceError::InvalidNonce` if the provided nonce doesn't match.
+    pub fn reserve_nonce(
+        &self,
+        user: Address,
+        provided_nonce: u64,
+    ) -> Result<NonceReservation, NonceError> {
+        let nonces = self.nonces.read().expect("nonce lock poisoned");
+        let expected = nonces.get(&user).copied().unwrap_or(0);
+
+        if provided_nonce != expected {
+            return Err(NonceError::InvalidNonce {
+                expected,
+                provided: provided_nonce,
+            });
+        }
+
+        Ok(NonceReservation::new(user, expected))
+    }
+
+    /// Commit a nonce reservation, incrementing the nonce.
+    ///
+    /// This should be called after successful transaction execution.
+    /// If the reservation was already committed, this is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current nonce doesn't match the reservation's expected nonce.
+    /// This indicates a bug - the nonce was modified outside the reservation system.
+    pub fn commit_reservation(&self, reservation: &NonceReservation) {
+        // Check if already committed
+        if reservation.is_committed() {
+            return;
+        }
+
+        let mut nonces = self.nonces.write().expect("nonce lock poisoned");
+        let current = nonces.get(&reservation.user).copied().unwrap_or(0);
+
+        // Sanity check: nonce should not have changed since reservation
+        assert_eq!(
+            current, reservation.expected_nonce,
+            "Nonce was modified outside reservation system: expected {}, found {}",
+            reservation.expected_nonce, current
+        );
+
+        *nonces.entry(reservation.user).or_insert(0) += 1;
+        reservation.mark_committed();
     }
 
     /// Decrement the nonce (for rollback on execution failure).
@@ -375,5 +501,122 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("expected 5"));
         assert!(msg.contains("provided 10"));
+    }
+
+    // Two-phase nonce pattern tests
+
+    #[test]
+    fn test_reserve_nonce_success() {
+        let manager = PrivateNonceManager::new();
+        let user = test_user();
+
+        // Reserve nonce 0 for new user
+        let reservation = manager.reserve_nonce(user, 0).unwrap();
+
+        // Nonce should NOT be incremented yet
+        assert_eq!(manager.get_nonce(user), 0);
+        assert!(!reservation.is_committed());
+        assert_eq!(reservation.user(), user);
+        assert_eq!(reservation.expected_nonce(), 0);
+    }
+
+    #[test]
+    fn test_reserve_nonce_invalid() {
+        let manager = PrivateNonceManager::new();
+        let user = test_user();
+
+        // Trying to reserve wrong nonce should fail
+        let err = manager.reserve_nonce(user, 5).unwrap_err();
+        assert!(matches!(
+            err,
+            NonceError::InvalidNonce {
+                expected: 0,
+                provided: 5
+            }
+        ));
+
+        // Nonce should remain unchanged
+        assert_eq!(manager.get_nonce(user), 0);
+    }
+
+    #[test]
+    fn test_commit_reservation() {
+        let manager = PrivateNonceManager::new();
+        let user = test_user();
+
+        // Reserve nonce
+        let reservation = manager.reserve_nonce(user, 0).unwrap();
+        assert_eq!(manager.get_nonce(user), 0);
+
+        // Commit reservation
+        manager.commit_reservation(&reservation);
+
+        // Now nonce should be incremented
+        assert_eq!(manager.get_nonce(user), 1);
+        assert!(reservation.is_committed());
+    }
+
+    #[test]
+    fn test_dropped_reservation_does_not_increment() {
+        let manager = PrivateNonceManager::new();
+        let user = test_user();
+
+        // Reserve nonce
+        {
+            let reservation = manager.reserve_nonce(user, 0).unwrap();
+            assert!(!reservation.is_committed());
+            // Reservation dropped without commit
+        }
+
+        // Nonce should remain unchanged
+        assert_eq!(manager.get_nonce(user), 0);
+
+        // Should be able to reserve again with same nonce
+        let reservation2 = manager.reserve_nonce(user, 0).unwrap();
+        manager.commit_reservation(&reservation2);
+        assert_eq!(manager.get_nonce(user), 1);
+    }
+
+    #[test]
+    fn test_double_commit_is_noop() {
+        let manager = PrivateNonceManager::new();
+        let user = test_user();
+
+        let reservation = manager.reserve_nonce(user, 0).unwrap();
+
+        // Commit twice
+        manager.commit_reservation(&reservation);
+        manager.commit_reservation(&reservation);
+
+        // Nonce should only increment once
+        assert_eq!(manager.get_nonce(user), 1);
+    }
+
+    #[test]
+    fn test_sequential_reservations() {
+        let manager = PrivateNonceManager::new();
+        let user = test_user();
+
+        // First transaction
+        let res1 = manager.reserve_nonce(user, 0).unwrap();
+        manager.commit_reservation(&res1);
+        assert_eq!(manager.get_nonce(user), 1);
+
+        // Second transaction
+        let res2 = manager.reserve_nonce(user, 1).unwrap();
+        manager.commit_reservation(&res2);
+        assert_eq!(manager.get_nonce(user), 2);
+
+        // Third transaction fails, nonce unchanged
+        {
+            let _res3 = manager.reserve_nonce(user, 2).unwrap();
+            // Simulating execution failure - drop without commit
+        }
+        assert_eq!(manager.get_nonce(user), 2);
+
+        // Retry succeeds
+        let res3 = manager.reserve_nonce(user, 2).unwrap();
+        manager.commit_reservation(&res3);
+        assert_eq!(manager.get_nonce(user), 3);
     }
 }

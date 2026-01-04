@@ -71,10 +71,55 @@ pub fn set_context(ctx: PrecompileContext) {
 /// Clear the precompile context for the current thread.
 ///
 /// This should be called after transaction execution to clean up.
+/// Prefer using [`ContextGuard`] for automatic cleanup.
 pub fn clear_context() {
     CONTEXT.with(|c| {
         *c.borrow_mut() = None;
     });
+}
+
+/// RAII guard that clears the precompile context when dropped.
+///
+/// This ensures context is always cleaned up, even on panic or early return.
+/// Use [`set_context_guarded`] to create a guard.
+///
+/// # Example
+///
+/// ```ignore
+/// let _guard = set_context_guarded(ctx);
+/// // Context is active here
+/// // ... execution (may panic or return early) ...
+/// // Context is automatically cleared when _guard is dropped
+/// ```
+#[derive(Debug)]
+#[must_use = "ContextGuard must be held for the duration of execution; dropping it clears context"]
+pub struct ContextGuard {
+    // Private field prevents direct construction
+    _private: (),
+}
+
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        clear_context();
+    }
+}
+
+/// Set the precompile context and return a guard that clears it on drop.
+///
+/// This is the preferred way to set context as it guarantees cleanup
+/// even if the code panics or returns early.
+///
+/// # Example
+///
+/// ```ignore
+/// let _guard = set_context_guarded(ctx);
+/// // Context is active
+/// evm.execute()?; // May panic or return Err
+/// // Guard ensures cleanup happens regardless
+/// ```
+pub fn set_context_guarded(ctx: PrecompileContext) -> ContextGuard {
+    set_context(ctx);
+    ContextGuard { _private: () }
 }
 
 /// Execute a function with access to the current precompile context.
@@ -184,6 +229,57 @@ mod tests {
         assert!(has_context());
 
         clear_context();
+        assert!(!has_context());
+    }
+
+    #[test]
+    fn test_context_guard_clears_on_drop() {
+        clear_context();
+        assert!(!has_context());
+
+        {
+            let _guard = set_context_guarded(setup_test_context());
+            assert!(has_context());
+
+            let caller = with_context(|c| c.caller);
+            assert_eq!(caller, Some(test_address(1)));
+        }
+
+        // Context should be cleared when guard is dropped
+        assert!(!has_context());
+    }
+
+    #[test]
+    fn test_context_guard_clears_on_early_return() {
+        clear_context();
+
+        // Simulate early return scenario
+        let result: Option<Address> = {
+            let _guard = set_context_guarded(setup_test_context());
+            assert!(has_context());
+
+            // Get caller and "return early"
+            with_context(|c| c.caller)
+        };
+
+        assert_eq!(result, Some(test_address(1)));
+
+        // Context should be cleared after scope exits
+        assert!(!has_context());
+    }
+
+    #[test]
+    fn test_context_guard_clears_on_panic() {
+        clear_context();
+
+        let result = std::panic::catch_unwind(|| {
+            let _guard = set_context_guarded(setup_test_context());
+            assert!(has_context());
+            panic!("intentional panic for testing");
+        });
+
+        assert!(result.is_err());
+        // Context should be cleared even after panic
         assert!(!has_context());
     }
 }

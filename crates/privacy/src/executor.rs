@@ -51,8 +51,8 @@ use crate::{
     evm::PrivacyEvmFactory,
     inspector::{PrivacyInspector, SlotKeyCache},
     mode::PrivacyMode,
-    nonce::{NonceError, PrivateNonceManager},
-    precompiles::{clear_context, setup_precompile_context},
+    nonce::{NonceError, NonceReservation, PrivateNonceManager},
+    precompiles::setup_precompile_context_guarded,
     registry::PrivacyRegistry,
     shielded::ShieldedKeyManager,
     store::PrivateStateStore,
@@ -243,29 +243,42 @@ impl PrivateTransactionExecutor {
     ///
     /// For now, this provides the validation and mode resolution logic,
     /// leaving actual EVM execution to the integration layer.
+    ///
+    /// # Two-Phase Nonce Pattern
+    ///
+    /// This method returns a `NonceReservation` along with the prepared execution.
+    /// The reservation validates the nonce but does NOT increment it.
+    /// After successful execution, call `commit_reservation()` to increment the nonce.
+    /// If execution fails, drop the reservation without committing - the nonce
+    /// remains unchanged and the transaction can be retried.
     pub fn prepare_execution(
         &self,
         tx: &PrivateTransaction,
-    ) -> Result<PreparedExecution, ExecutorError> {
+    ) -> Result<(PreparedExecution, NonceReservation), ExecutorError> {
         // Validate the transaction
         self.validate(tx)?;
 
         // Resolve effective sender
         let effective_sender = self.resolve_effective_sender(tx);
 
-        // Use the nonce (increment it)
-        self.nonce_manager
-            .use_nonce(tx.from, tx.private_nonce)
+        // Reserve the nonce (validates but does NOT increment)
+        // The reservation must be committed after successful execution
+        let reservation = self
+            .nonce_manager
+            .reserve_nonce(tx.from, tx.private_nonce)
             .map_err(ExecutorError::Nonce)?;
 
-        Ok(PreparedExecution {
-            effective_sender,
-            real_sender: tx.from,
-            to: tx.to,
-            data: tx.data.clone(),
-            gas_limit: tx.gas_limit,
-            mode: tx.mode,
-        })
+        Ok((
+            PreparedExecution {
+                effective_sender,
+                real_sender: tx.from,
+                to: tx.to,
+                data: tx.data.clone(),
+                gas_limit: tx.gas_limit,
+                mode: tx.mode,
+            },
+            reservation,
+        ))
     }
 
     /// Execute a private transaction with EVM.
@@ -303,8 +316,8 @@ impl PrivateTransactionExecutor {
         DB: Database + DatabaseCommit + Clone + Debug,
         DB::Error: std::error::Error + Send + Sync + 'static,
     {
-        // 1. Validate and prepare
-        let prepared = self.prepare_execution(tx)?;
+        // 1. Validate and prepare (nonce is reserved but NOT incremented)
+        let (prepared, nonce_reservation) = self.prepare_execution(tx)?;
 
         // 2. Set up privacy database
         let slot_key_cache = Arc::new(SlotKeyCache::new());
@@ -319,8 +332,9 @@ impl PrivateTransactionExecutor {
         let block_number: u64 = block_env.number.try_into().unwrap_or(u64::MAX);
         privacy_db.set_block(block_number);
 
-        // 3. Set up precompile context
-        setup_precompile_context(
+        // 3. Set up precompile context with RAII guard
+        // The guard ensures context is cleared even if we panic or return early
+        let _context_guard = setup_precompile_context_guarded(
             Arc::clone(&self.registry),
             Arc::clone(&self.private_store),
             prepared.effective_sender,
@@ -383,11 +397,16 @@ impl PrivateTransactionExecutor {
         let mut db = evm.into_db();
         db.commit(exec_result.state);
 
-        // 10. Clear precompile context
-        clear_context();
+        // 10. Clear transaction context from database
+        // Note: Precompile context is automatically cleared when _context_guard is dropped
         db.clear_tx_context();
 
-        // 11. Create block transaction if needed
+        // 11. Commit the nonce reservation now that execution succeeded
+        // If we had returned early due to an error, the reservation would be dropped
+        // without committing, leaving the nonce unchanged for retry
+        self.nonce_manager.commit_reservation(&nonce_reservation);
+
+        // 12. Create block transaction if needed
         let block_transaction = if public_write_occurred {
             Some(self.create_block_transaction(tx, prepared.effective_sender)?)
         } else {
@@ -439,8 +458,15 @@ impl PrivateTransactionExecutor {
 
     /// Roll back a nonce after execution failure.
     ///
-    /// Call this if `prepare_execution` succeeded but EVM execution failed
-    /// and the transaction should be retryable.
+    /// # Deprecated
+    ///
+    /// With the two-phase nonce pattern, this method is rarely needed.
+    /// `prepare_execution` now returns a `NonceReservation` that only
+    /// increments the nonce when `commit_reservation()` is called.
+    /// If execution fails, simply drop the reservation without committing.
+    ///
+    /// This method is kept for backwards compatibility with code that
+    /// uses `use_nonce()` directly instead of the two-phase pattern.
     pub fn rollback_nonce(&self, user: Address) {
         self.nonce_manager.decrement_nonce(user);
     }

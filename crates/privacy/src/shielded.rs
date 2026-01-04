@@ -122,19 +122,16 @@ impl ShieldedKeyManager {
         seed
     }
 
-    /// Generate a seed for a user.
+    /// Generate a cryptographically random seed for a user.
     ///
-    /// **Note**: This uses deterministic derivation for testing.
-    /// In production, use a cryptographically secure RNG.
-    fn generate_seed(&self, user: Address) -> [u8; 32] {
-        // Deterministic seed generation for testing/development
-        // Production should use: rand::rngs::OsRng.gen()
-        let mut data = Vec::with_capacity(64);
-        data.extend_from_slice(b"user_seed_v1");
-        data.extend_from_slice(user.as_slice());
-        data.extend_from_slice(&self.chain_id.to_be_bytes());
-        // Add timestamp or random entropy in production
-        keccak256(&data).0
+    /// This uses the operating system's secure random number generator
+    /// to produce a 32-byte seed that cannot be predicted or derived
+    /// from public information.
+    ///
+    /// For testing with reproducible results, use [`set_seed`] to inject
+    /// a known seed value instead.
+    fn generate_seed(&self, _user: Address) -> [u8; 32] {
+        rand::random()
     }
 
     /// Set a user's seed directly.
@@ -364,10 +361,34 @@ mod tests {
     fn test_different_users_different_seeds() {
         let manager = ShieldedKeyManager::new(84532);
 
+        // With RNG, different users will get different random seeds
         let seed1 = manager.get_or_create_seed(test_user());
         let seed2 = manager.get_or_create_seed(test_user2());
 
+        // Seeds should be different (extremely unlikely to collide with 32 random bytes)
         assert_ne!(seed1, seed2);
+    }
+
+    #[test]
+    fn test_rng_seed_generation_produces_unique_seeds() {
+        let manager = ShieldedKeyManager::new(84532);
+
+        // Generate multiple seeds and verify they're all unique
+        let users: Vec<Address> = (0..10)
+            .map(|i| Address::new([i as u8; 20]))
+            .collect();
+
+        let seeds: Vec<[u8; 32]> = users
+            .iter()
+            .map(|u| manager.get_or_create_seed(*u))
+            .collect();
+
+        // All seeds should be unique
+        for i in 0..seeds.len() {
+            for j in (i + 1)..seeds.len() {
+                assert_ne!(seeds[i], seeds[j], "Seeds at {} and {} should differ", i, j);
+            }
+        }
     }
 
     #[test]

@@ -52,7 +52,9 @@ pub mod store;
 pub mod transaction;
 
 // Re-exports for convenient access
-pub use classification::{classify_slot, SlotClassification};
+pub use classification::{
+    classify_slot, classify_slot_defensive, DefensiveClassification, SlotClassification,
+};
 pub use database::{PrivacyDatabase, PrivacyDatabaseError};
 pub use registry::{
     OwnershipType, PrivacyRegistry, PrivateContractConfig, RegistryError, SlotConfig, SlotType,
@@ -68,7 +70,7 @@ pub use inspector::{PrivacyInspector, SlotKeyCache};
 
 // Phase 7 exports
 pub use mode::PrivacyMode;
-pub use nonce::{NonceError, PrivateNonceManager};
+pub use nonce::{NonceError, NonceReservation, PrivateNonceManager};
 pub use shielded::{DerivedKey, ShieldedKeyManager};
 pub use transaction::{PrivateTransaction, PrivateTransactionError};
 pub use executor::{

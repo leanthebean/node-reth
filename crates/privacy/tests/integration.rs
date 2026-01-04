@@ -242,18 +242,16 @@ fn test_privacy_database_public_slot_passthrough() {
 
 #[test]
 fn test_privacy_database_with_slot_key_cache() {
-    let mut mock_db = MockDatabase::default();
+    let mock_db = MockDatabase::default();
     let registry = Arc::new(PrivacyRegistry::new());
     let store = Arc::new(PrivateStateStore::new());
 
-    // Set up a value in the mock database
+    // Set up a value in the private store (not the mock database)
     let contract = test_address(1);
     let user = test_address(10);
     let base_slot = U256::from(1);
     let computed_slot = compute_mapping_slot(user, base_slot);
     let value = U256::from(1000);
-
-    mock_db.storage.insert((contract, computed_slot), value);
 
     // Register the contract with a mapping slot
     let admin = test_address(2);
@@ -277,13 +275,16 @@ fn test_privacy_database_with_slot_key_cache() {
     let key = key_from_data(&data);
     cache.insert(contract, computed_slot, base_slot, key);
 
+    // Set the value in the private store with user as owner
+    store.set(contract, computed_slot, value, user);
+
     // Create privacy database with the cache
     let mut privacy_db = PrivacyDatabase::new(mock_db, Arc::clone(&registry), Arc::clone(&store));
     privacy_db.set_slot_key_cache(cache);
     privacy_db.set_tx_sender(user); // User is the transaction sender
 
-    // The slot should be classified as private (mapping slot with registered contract)
-    // When we read, it should work because we haven't committed yet (reads go to inner db)
+    // The slot is classified as private (mapping slot with registered contract)
+    // Reading as owner should return the value from the private store
     let read_value = privacy_db.storage(contract, computed_slot).unwrap();
     assert_eq!(read_value, value);
 }
@@ -854,7 +855,7 @@ fn test_executor_effective_sender_shielded_mode() {
 }
 
 #[test]
-fn test_executor_nonce_increment_on_prepare() {
+fn test_executor_two_phase_nonce() {
     let (executor, _, _, nonce_manager) = create_test_executor();
 
     // Initial nonce should be 0
@@ -868,12 +869,53 @@ fn test_executor_nonce_increment_on_prepare() {
         0,
     );
 
-    // Prepare execution (which uses the nonce)
+    // Prepare execution returns a reservation (nonce NOT incremented yet)
     let result = executor.prepare_execution(&tx);
     assert!(result.is_ok());
 
-    // Nonce should be incremented
+    let (prepared, reservation) = result.unwrap();
+    assert_eq!(prepared.effective_sender, test_user_address());
+    assert!(!reservation.is_committed());
+
+    // Nonce should NOT be incremented yet
+    assert_eq!(nonce_manager.get_nonce(test_user_address()), 0);
+
+    // Commit the reservation (simulating successful execution)
+    nonce_manager.commit_reservation(&reservation);
+
+    // Now nonce should be incremented
     assert_eq!(nonce_manager.get_nonce(test_user_address()), 1);
+    assert!(reservation.is_committed());
+}
+
+#[test]
+fn test_executor_dropped_reservation_leaves_nonce_unchanged() {
+    let (executor, _, _, nonce_manager) = create_test_executor();
+
+    // Initial nonce should be 0
+    assert_eq!(nonce_manager.get_nonce(test_user_address()), 0);
+
+    let tx = create_signed_tx(
+        test_user_address(),
+        test_address(1),
+        Bytes::new(),
+        PrivacyMode::Real,
+        0,
+    );
+
+    // Prepare execution, but don't commit (simulating execution failure)
+    {
+        let result = executor.prepare_execution(&tx);
+        assert!(result.is_ok());
+        // Reservation dropped without commit
+    }
+
+    // Nonce should remain unchanged
+    assert_eq!(nonce_manager.get_nonce(test_user_address()), 0);
+
+    // Can retry with same nonce
+    let result = executor.prepare_execution(&tx);
+    assert!(result.is_ok());
 }
 
 #[test]

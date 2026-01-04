@@ -62,7 +62,7 @@ pub mod auth;
 pub mod registry;
 
 pub use constants::{AUTH_PRECOMPILE_ADDRESS, REGISTRY_PRECOMPILE_ADDRESS};
-pub use context::{clear_context, set_context, PrecompileContext};
+pub use context::{clear_context, set_context, set_context_guarded, ContextGuard, PrecompileContext};
 pub use encoding::{
     AuthGrantInput, AuthRevokeInput, IsAuthorizedInput, RegistrationInput, SlotConfigInput,
 };
@@ -138,6 +138,41 @@ pub fn setup_precompile_context(
     block: u64,
 ) {
     set_context(PrecompileContext::new(registry, store, caller, block));
+}
+
+/// Helper function to set up the precompile context with RAII guard.
+///
+/// This is the preferred method as it guarantees cleanup even on panic
+/// or early return. The context is automatically cleared when the
+/// returned guard is dropped.
+///
+/// # Arguments
+///
+/// * `registry` - The privacy registry
+/// * `store` - The private state store
+/// * `caller` - The address making the call (msg.sender in precompile context)
+/// * `block` - The current block number
+///
+/// # Returns
+///
+/// A [`ContextGuard`] that clears the context when dropped.
+///
+/// # Example
+///
+/// ```ignore
+/// use base_reth_privacy::precompiles::setup_precompile_context_guarded;
+///
+/// let _guard = setup_precompile_context_guarded(registry, store, caller, block_number);
+/// // ... execute transaction (may panic or return early) ...
+/// // Context is automatically cleared when _guard goes out of scope
+/// ```
+pub fn setup_precompile_context_guarded(
+    registry: Arc<PrivacyRegistry>,
+    store: Arc<PrivateStateStore>,
+    caller: Address,
+    block: u64,
+) -> ContextGuard {
+    set_context_guarded(PrecompileContext::new(registry, store, caller, block))
 }
 
 #[cfg(test)]

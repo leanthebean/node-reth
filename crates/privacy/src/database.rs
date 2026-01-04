@@ -4,10 +4,12 @@
 //! and route private slots to the TEE-local store.
 
 use crate::{
-    classification::{classify_slot, resolve_mapping_owner, SlotClassification},
+    classification::{
+        classify_slot_defensive, resolve_mapping_owner, DefensiveClassification, SlotClassification,
+    },
     inspector::SlotKeyCache,
     registry::PrivacyRegistry,
-    store::PrivateStateStore,
+    store::{PrivateStateStore, READ},
 };
 use alloy_primitives::{Address, B256, U256};
 use revm::{
@@ -108,8 +110,15 @@ impl<DB> PrivacyDatabase<DB> {
     }
 
     /// Classify a storage slot as public or private.
+    ///
+    /// Uses defensive classification to prevent data leakage on first access
+    /// to unrecorded mapping slots.
     fn classify(&self, address: Address, slot: U256) -> SlotClassification {
-        classify_slot(&self.registry, address, slot)
+        let defensive = match self.tx_sender {
+            Some(caller) => DefensiveClassification::PrivateWithCaller(caller),
+            None => DefensiveClassification::PrivateWithContract,
+        };
+        classify_slot_defensive(&self.registry, address, slot, defensive)
     }
 
     /// Check if a slot value changed and needs to be routed to private store.
@@ -269,9 +278,26 @@ where
                     .storage(address, index)
                     .map_err(PrivacyDatabaseError::Inner)
             }
-            SlotClassification::Private { .. } => {
-                // Private slot: read from private store
-                Ok(self.private_store.get(address, index))
+            SlotClassification::Private { owner } => {
+                // Private slot: check authorization before returning value
+                let caller = self.tx_sender.unwrap_or(Address::ZERO);
+
+                // Check if caller is authorized to read this slot
+                let is_authorized = caller == owner
+                    || self.private_store.is_authorized(
+                        address,
+                        index,
+                        caller,
+                        READ,
+                    );
+
+                if is_authorized {
+                    Ok(self.private_store.get(address, index))
+                } else {
+                    // Fail-safe: return zero for unauthorized access
+                    // This prevents data leakage while allowing execution to continue
+                    Ok(U256::ZERO)
+                }
             }
         }
     }
@@ -311,7 +337,26 @@ where
                 .inner
                 .storage_ref(address, index)
                 .map_err(PrivacyDatabaseError::Inner),
-            SlotClassification::Private { .. } => Ok(self.private_store.get(address, index)),
+            SlotClassification::Private { owner } => {
+                // Private slot: check authorization before returning value
+                let caller = self.tx_sender.unwrap_or(Address::ZERO);
+
+                // Check if caller is authorized to read this slot
+                let is_authorized = caller == owner
+                    || self.private_store.is_authorized(
+                        address,
+                        index,
+                        caller,
+                        READ,
+                    );
+
+                if is_authorized {
+                    Ok(self.private_store.get(address, index))
+                } else {
+                    // Fail-safe: return zero for unauthorized access
+                    Ok(U256::ZERO)
+                }
+            }
         }
     }
 
@@ -520,6 +565,9 @@ mod tests {
 
         let mut db = PrivacyDatabase::new(EmptyDB::default(), registry, store);
 
+        // Set tx_sender to match owner for authorization
+        db.set_tx_sender(contract);
+
         // Read from private slot should return value from private store
         let result = db.storage(contract, private_slot).unwrap();
         assert_eq!(result, U256::from(12345));
@@ -537,7 +585,10 @@ mod tests {
 
         store.set(contract, private_slot, U256::from(999), contract);
 
-        let db = PrivacyDatabase::new(EmptyDB::default(), registry, store);
+        let mut db = PrivacyDatabase::new(EmptyDB::default(), registry, store);
+
+        // Set tx_sender to match owner for authorization
+        db.set_tx_sender(contract);
 
         // DatabaseRef should also route to private store
         let result = db.storage_ref(contract, private_slot).unwrap();
@@ -667,10 +718,63 @@ mod tests {
 
         let mut db = PrivacyDatabase::new(EmptyDB::default(), registry, store);
 
+        // Set tx_sender to match owner for authorization
+        db.set_tx_sender(contract1);
+
         // Contract1's slot is private
         assert_eq!(db.storage(contract1, slot).unwrap(), U256::from(111));
 
         // Contract2's slot is public (returns zero from EmptyDB)
         assert_eq!(db.storage(contract2, slot).unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn test_unauthorized_read_returns_zero() {
+        let contract = test_address(1);
+        let owner = test_address(2);
+        let unauthorized = test_address(3);
+        let private_slot = U256::from(5);
+        let (registry, store) = setup_registry_with_private_slot(contract, private_slot);
+
+        // Pre-populate private store with owner
+        store.set(contract, private_slot, U256::from(12345), owner);
+
+        let mut db = PrivacyDatabase::new(EmptyDB::default(), registry, store);
+
+        // Set tx_sender to an unauthorized address
+        db.set_tx_sender(unauthorized);
+
+        // Unauthorized read should return zero (fail-safe)
+        let result = db.storage(contract, private_slot).unwrap();
+        assert_eq!(result, U256::ZERO);
+
+        // Same for storage_ref
+        let result = db.storage_ref(contract, private_slot).unwrap();
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn test_authorized_delegate_can_read() {
+        let contract = test_address(1);
+        let owner = test_address(2);
+        let delegate = test_address(3);
+        let private_slot = U256::from(5);
+        let (registry, store) = setup_registry_with_private_slot(contract, private_slot);
+
+        // Pre-populate private store with owner
+        store.set(contract, private_slot, U256::from(42), owner);
+
+        // Grant read access to delegate (no expiry = 0)
+        let auth = crate::store::AuthEntry::new(crate::store::READ, 0, 0);
+        store.authorize(contract, private_slot, delegate, auth);
+
+        let mut db = PrivacyDatabase::new(EmptyDB::default(), registry, Arc::clone(&store));
+
+        // Set tx_sender to the delegate
+        db.set_tx_sender(delegate);
+
+        // Authorized delegate should be able to read
+        let result = db.storage(contract, private_slot).unwrap();
+        assert_eq!(result, U256::from(42));
     }
 }
